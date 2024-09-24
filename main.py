@@ -5,6 +5,7 @@ from matplotlib.widgets import Slider
 from environment import SimulationEnvironment
 from microphone import Microphone
 from fft_analysis import perform_fft
+from beamforming import delay_and_sum_beamforming_realtime
 
 class AcousticCameraSimulation:
     def __init__(self,
@@ -15,7 +16,8 @@ class AcousticCameraSimulation:
                  mic_positions=None,
                  sampling_rate=None,
                  animation_speed=20,
-                 animation_frames=1000):
+                 animation_frames=1000,
+                 beamforming_interval=1):
         # Simulation environment parameters
         self.grid_size = grid_size
         self.boundary_type = boundary_type
@@ -65,9 +67,19 @@ class AcousticCameraSimulation:
         self.frequency = 2.0  # Default frequency
         self.amplitude = 1.0  # Default amplitude
 
+        # Beamforming parameters
+        self.num_samples = 128  # Number of recent samples for beamforming
+        self.scan_grid_size = 50  # Resolution of the scan grid
+        self.intensity_map = None  # To store the intensity map
+        self.beamforming_interval = beamforming_interval  # Perform beamforming every N frames
+        self.frame_counter = 0  # Counter to track frames
+
+        # Initialize the heatmap for beamforming visualization
+        self.heatmap = None
+
     def setup_plot(self):
         # Set up the matplotlib figure with subplots
-        self.fig, (self.ax_wave, self.ax_fft) = plt.subplots(1, 2, figsize=(12, 6))
+        self.fig, (self.ax_wave, self.ax_heatmap, self.ax_fft) = plt.subplots(1, 3, figsize=(18, 6))
 
         # Wave propagation subplot
         self.im = self.ax_wave.imshow(self.env.grid, cmap='viridis', vmin=-1, vmax=1, animated=True)
@@ -79,6 +91,15 @@ class AcousticCameraSimulation:
         mic_y = [pos[0] for pos in self.mic_positions]
         self.mic_scatter = self.ax_wave.scatter(mic_x, mic_y, c='red', marker='o', label='Microphones')
         self.ax_wave.legend(loc='upper right')
+
+        # Heatmap subplot for beamforming results
+        self.heatmap_im = self.ax_heatmap.imshow(np.zeros((self.scan_grid_size, self.scan_grid_size)),
+                                                cmap='hot', extent=(0, self.grid_size[1], self.grid_size[0], 0),
+                                                animated=True)
+        self.ax_heatmap.set_title('Beamforming Intensity Map')
+        self.ax_heatmap.set_xlabel('X Position')
+        self.ax_heatmap.set_ylabel('Y Position')
+        plt.colorbar(self.heatmap_im, ax=self.ax_heatmap)
 
         # FFT subplot
         colors = ['blue', 'green', 'orange', 'purple', 'cyan']  # Extend if more microphones are added
@@ -109,6 +130,10 @@ class AcousticCameraSimulation:
         # Connect sliders to update functions
         self.slider_freq.on_changed(self.update_frequency)
         self.slider_amp.on_changed(self.update_amplitude)
+
+        # Set up the scan grid for beamforming
+        self.setup_scan_grid()
+
 
     def update_frequency(self, val):
         self.frequency = self.slider_freq.val
@@ -154,6 +179,7 @@ class AcousticCameraSimulation:
 
     def update(self, frame):
         current_time = frame * self.env.time_step
+        self.frame_counter += 1
 
         # Inject wave source
         self.inject_wave_source(current_time)
@@ -168,8 +194,22 @@ class AcousticCameraSimulation:
         # Update FFT plots
         self.update_fft_plots()
 
+        # Perform beamforming at specified intervals
+        if self.frame_counter % self.beamforming_interval == 0:
+            self.perform_beamforming_realtime()
+            intensity_reshaped = self.intensity_map.reshape(self.X_scan.shape)
+            self.heatmap_im.set_data(intensity_reshaped)
+            # Optionally adjust color scale
+            self.heatmap_im.set_clim(vmin=np.min(intensity_reshaped), vmax=np.max(intensity_reshaped))
+        else:
+            # Keep the previous intensity map
+            pass
+
         # Return the updated artists
-        return [self.im, self.mic_scatter] + self.lines
+        return [self.im, self.mic_scatter, self.heatmap_im] + self.lines
+
+
+
 
     def run_simulation(self):
         # Set up the plot
@@ -195,6 +235,9 @@ class AcousticCameraSimulation:
         # Print recorded amplitudes (optional)
         for i, mic in enumerate(self.microphones, start=1):
             print(f"Microphone {i} at position {mic.position} recorded {len(mic.recorded_amplitudes)} samples.")
+        
+        self.perform_beamforming()
+
         return
         # Perform FFT analysis for each microphone
         for i, mic in enumerate(self.microphones, start=1):
@@ -206,6 +249,55 @@ class AcousticCameraSimulation:
             plt.xlabel('Frequency (Hz)')
             plt.ylabel('Amplitude')
             plt.show()
+    
+    def perform_beamforming(self):
+        from beamforming import delay_and_sum_beamforming
+
+        # Define scan positions along the line (e.g., x positions)
+        scan_positions = []
+        x_positions = np.linspace(0, self.grid_size[1] - 1, num=100)  # Assuming horizontal line
+        y_fixed = self.center_y  # y-coordinate is fixed for 1D imaging
+
+        for x in x_positions:
+            scan_positions.append((y_fixed, x))  # Note: positions are (row, column)
+
+        # Perform beamforming
+        intensity_map = delay_and_sum_beamforming(
+            microphones=self.microphones,
+            sound_speed=self.wave_speed,
+            scan_positions=scan_positions,
+            sampling_rate=self.sampling_rate
+        )
+
+        # Plot the intensity map
+        plt.figure()
+        plt.plot(x_positions, intensity_map)
+        plt.title('1D Sound Image using Delay-and-Sum Beamforming')
+        plt.xlabel('Position along array (x)')
+        plt.ylabel('Intensity')
+        plt.show()
+    
+    def perform_beamforming_realtime(self):
+
+        # Perform beamforming
+        self.intensity_map = delay_and_sum_beamforming_realtime(
+            microphones=self.microphones,
+            sound_speed=self.wave_speed,
+            scan_positions=self.scan_positions,
+            sampling_rate=self.sampling_rate,
+            num_samples=self.num_samples
+        )
+
+    
+    def setup_scan_grid(self):
+        # Define scan positions (x, y) over the simulation area
+        x_min, x_max = 0, self.grid_size[1] - 1
+        y_min, y_max = 0, self.grid_size[0] - 1
+        x_positions = np.linspace(x_min, x_max, self.scan_grid_size)
+        y_positions = np.linspace(y_min, y_max, self.scan_grid_size)
+        self.X_scan, self.Y_scan = np.meshgrid(x_positions, y_positions)
+        self.scan_positions = np.vstack([self.Y_scan.ravel(), self.X_scan.ravel()]).T  # Shape (N, 2)
+
 
 
 import math
@@ -242,11 +334,11 @@ class MicArray:
 
 
 if __name__ == '__main__':
-    grid_w = 200
-    grid_h = 200
+    grid_w = 100
+    grid_h = 100
 
     mic_array = MicArray(grid_width=grid_w, grid_height=grid_h)
-    lineMicArray = mic_array.lineArray(count=20, x_start=10, y_start=20, x_end=25, y_end=80)
+    lineMicArray = mic_array.lineArray(count=10, x_start=0, y_start=20, x_end=10, y_end=70)
     arcMicArray = mic_array.arcArray(count=5, radius=50, angle_start=0, angle_end=180, center_x=50, center_y=50)
 
     # Example usage
@@ -257,6 +349,7 @@ if __name__ == '__main__':
         time_step=0.1,
         mic_positions=lineMicArray,
         animation_speed=20,
-        animation_frames=5000
+        animation_frames=1000,
+        beamforming_interval=10
     )
     simulation.run_simulation()
